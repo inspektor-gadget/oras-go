@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/gofrs/flock"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -76,8 +77,8 @@ type Store struct {
 	// Operations such as Fetch, Push use sync.RLock(), while Delete uses
 	// sync.Lock().
 	sync sync.RWMutex
-	// indexLock ensures that only one go-routine is writing to the index.
-	indexLock sync.Mutex
+	// indexLock ensures that only one process is writing to the index.
+	indexLock *flock.Flock
 }
 
 // New creates a new OCI store with context.Background().
@@ -96,14 +97,17 @@ func NewWithContext(ctx context.Context, root string) (*Store, error) {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
 
+	indexPath := filepath.Join(rootAbs, ocispec.ImageIndexFile)
+
 	store := &Store{
 		AutoSaveIndex: true,
 		AutoGC:        true,
 		root:          rootAbs,
-		indexPath:     filepath.Join(rootAbs, ocispec.ImageIndexFile),
+		indexPath:     indexPath,
 		storage:       storage,
 		tagResolver:   resolver.NewMemory(),
 		graph:         graph.NewMemory(),
+		indexLock:     flock.New(indexPath + ".lock"),
 	}
 
 	if err := ensureDir(filepath.Join(rootAbs, ocispec.ImageBlobsDir)); err != nil {
@@ -368,6 +372,9 @@ func (s *Store) ensureOCILayoutFile() error {
 // loadIndexFile reads index.json from the file system.
 // Create index.json if it does not exist.
 func (s *Store) loadIndexFile(ctx context.Context) error {
+	s.indexLock.RLock()
+	defer s.indexLock.Unlock()
+
 	indexFile, err := os.Open(s.indexPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
