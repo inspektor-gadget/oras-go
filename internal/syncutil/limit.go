@@ -66,6 +66,13 @@ func (lr *LimitedRegion) End() {
 // GoFunc represents a function that can be invoked by Go.
 type GoFunc[T any] func(ctx context.Context, region *LimitedRegion, t T) error
 
+// concreteError is a workaround to allow storing different kind of errors in
+// atomic.Value. otherwise it'll fail with "compare and swap of inconsistently
+// typed value into Value".
+type concreteError struct {
+	err error
+}
+
 // Go concurrently invokes fn on items.
 func Go[T any](ctx context.Context, limiter *semaphore.Weighted, fn GoFunc[T], items ...T) error {
 	eg, egCtx := errgroup.WithContext(ctx)
@@ -73,8 +80,8 @@ func Go[T any](ctx context.Context, limiter *semaphore.Weighted, fn GoFunc[T], i
 	for _, item := range items {
 		region := LimitRegion(egCtx, limiter)
 		if err := region.Start(); err != nil {
-			if egErr, ok := egErr.Load().(error); ok && egErr != nil {
-				return egErr
+			if egErr, ok := egErr.Load().(*concreteError); ok && egErr != nil {
+				return egErr.err
 			}
 			return err
 		}
@@ -83,7 +90,8 @@ func Go[T any](ctx context.Context, limiter *semaphore.Weighted, fn GoFunc[T], i
 				defer region.End()
 				err := fn(egCtx, region, t)
 				if err != nil {
-					egErr.CompareAndSwap(nil, err)
+					cr := &concreteError{err: err}
+					egErr.CompareAndSwap(nil, cr)
 					return err
 				}
 				return nil

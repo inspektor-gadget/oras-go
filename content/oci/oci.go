@@ -27,8 +27,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sync"
 
+	"github.com/gofrs/flock"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -76,8 +78,8 @@ type Store struct {
 	// Operations such as Fetch, Push use sync.RLock(), while Delete uses
 	// sync.Lock().
 	sync sync.RWMutex
-	// indexLock ensures that only one go-routine is writing to the index.
-	indexLock sync.Mutex
+	// indexLock ensures that only one process is writing to the index.
+	indexLock *flock.Flock
 }
 
 // New creates a new OCI store with context.Background().
@@ -96,15 +98,21 @@ func NewWithContext(ctx context.Context, root string) (*Store, error) {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
 
+	indexPath := filepath.Join(rootAbs, ocispec.ImageIndexFile)
+
 	store := &Store{
 		AutoSaveIndex: true,
 		AutoGC:        true,
 		root:          rootAbs,
-		indexPath:     filepath.Join(rootAbs, ocispec.ImageIndexFile),
+		indexPath:     indexPath,
 		storage:       storage,
 		tagResolver:   resolver.NewMemory(),
 		graph:         graph.NewMemory(),
+		indexLock:     flock.New(indexPath + ".lock"),
 	}
+
+	store.indexLock.RLock()
+	defer store.indexLock.Unlock()
 
 	if err := ensureDir(filepath.Join(rootAbs, ocispec.ImageBlobsDir)); err != nil {
 		return nil, err
@@ -112,8 +120,13 @@ func NewWithContext(ctx context.Context, root string) (*Store, error) {
 	if err := store.ensureOCILayoutFile(); err != nil {
 		return nil, fmt.Errorf("invalid OCI Image Layout: %w", err)
 	}
-	if err := store.loadIndexFile(ctx); err != nil {
+	index, err := store.readIndexFile()
+	if err != nil {
 		return nil, fmt.Errorf("invalid OCI Image Index: %w", err)
+	}
+	store.index = index
+	if err := loadIndex(ctx, store.index, store.storage, store.tagResolver, store.graph); err != nil {
+		return nil, err
 	}
 
 	return store, nil
@@ -365,13 +378,13 @@ func (s *Store) ensureOCILayoutFile() error {
 	return validateOCILayout(&layout)
 }
 
-// loadIndexFile reads index.json from the file system.
+// readIndexFile reads index.json from the file system.
 // Create index.json if it does not exist.
-func (s *Store) loadIndexFile(ctx context.Context) error {
+func (s *Store) readIndexFile() (*ocispec.Index, error) {
 	indexFile, err := os.Open(s.indexPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to open index file: %w", err)
+			return nil, fmt.Errorf("failed to open index file: %w", err)
 		}
 
 		// write index.json if it does not exist
@@ -381,16 +394,16 @@ func (s *Store) loadIndexFile(ctx context.Context) error {
 			},
 			Manifests: []ocispec.Descriptor{},
 		}
-		return s.writeIndexFile()
+		return s.index, s.writeIndexFile()
 	}
 	defer indexFile.Close()
 
 	var index ocispec.Index
 	if err := json.NewDecoder(indexFile).Decode(&index); err != nil {
-		return fmt.Errorf("failed to decode index file: %w", err)
+		return nil, fmt.Errorf("failed to decode index file: %w", err)
 	}
-	s.index = &index
-	return loadIndex(ctx, s.index, s.storage, s.tagResolver, s.graph)
+
+	return &index, nil
 }
 
 // SaveIndex writes the `index.json` file to the file system.
@@ -409,6 +422,16 @@ func (s *Store) SaveIndex() error {
 func (s *Store) saveIndex() error {
 	s.indexLock.Lock()
 	defer s.indexLock.Unlock()
+
+	// 0. Check if the index has been changed.
+	currentIndex, err := s.readIndexFile()
+	if err != nil {
+		return err
+	}
+
+	if !reflect.DeepEqual(currentIndex, s.index) {
+		return errdef.ErrRetry
+	}
 
 	var manifests []ocispec.Descriptor
 	tagged := set.New[digest.Digest]()
